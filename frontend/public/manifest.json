@@ -1,0 +1,9 @@
+{
+  "name": "Delivery 360",
+  "short_name": "Delivery360",
+  "display": "standalone",
+  "start_url": "/",
+  "background_color": "#ffffff",
+  "theme_color": "#111827",
+  "icons": []
+}
