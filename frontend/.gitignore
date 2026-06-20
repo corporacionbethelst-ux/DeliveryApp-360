@@ -1,0 +1,30 @@
+# frontend/.gitignore
+
+# Dependencias
+node_modules/
+.npm/
+.pnpm/
+
+# Next.js build output (GENERADO AUTOMÁTICAMENTE)
+.next/
+out/
+.next/cache/
+
+# Environment variables (nunca subir secretos)
+.env*.local
+!.env.example
+
+# IDE y editor
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+# TypeScript incremental cache
+*.tsbuildinfo

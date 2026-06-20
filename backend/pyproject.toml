@@ -1,0 +1,17 @@
+[project]
+name = "delivery360-backend"
+version = "0.1.0"
+description = "Delivery 360 backend scaffold"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning"
+]
+
+[tool.black]
+line-length = 88
