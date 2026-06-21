@@ -5,6 +5,7 @@ Optimizado para rendimiento, paginación estable y serialización robusta.
 from datetime import datetime, timezone
 import uuid
 from typing import Optional, Dict, Any
+from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -18,6 +19,8 @@ from app.models.delivery import Delivery, DeliveryStatus
 from app.models.order import Order, OrderStatus
 from app.models.rider import Rider, RiderStatus
 from app.models.user import User, UserRole
+from app.models.financial import TransactionType, PaymentStatus
+from app.services.financial_service import FinancialService
 
 router = APIRouter(prefix="/deliveries")
 
@@ -384,6 +387,9 @@ async def complete_delivery(
         order.status = OrderStatus.ENTREGADO
         order.delivered_at = now
 
+    # CRITICAL FIX: Crear registro financiero para el pago al repartidor
+    await _create_financial_record_for_delivery(db, delivery, order, now)
+
     await db.commit()
     
     await db.refresh(delivery, attribute_names=['rider', 'order'])
@@ -404,6 +410,65 @@ async def complete_delivery(
     d_row, r_row, u_row, o_row = res.first()
     
     return _serialize_delivery(d_row, r_row, u_row, o_row)
+
+
+async def _create_financial_record_for_delivery(db: AsyncSession, delivery: Delivery, order: Optional[Order], completed_at: datetime) -> None:
+    """
+    Crea el registro financiero para el pago al repartidor cuando se completa una entrega.
+    Esta función es idempotente: si el registro ya existe, no hace nada.
+    """
+    if not delivery.rider_id:
+        return
+    
+    rider_id = delivery.rider_id
+    idempotency_key = f"delivery_{delivery.id}_rider_{rider_id}_payment"
+    
+    from app.models.financial import Financial
+    existing_payment = await db.execute(
+        select(Financial).where(
+            Financial.rider_id == rider_id,
+            Financial.idempotency_key == idempotency_key
+        )
+    )
+    payment = existing_payment.scalar_one_or_none()
+    
+    if payment:
+        logger.info(f"Registro financiero ya existe para entrega {delivery.id}")
+        return
+    
+    # Calcular ganancia del repartidor
+    base_rate = Decimal("2.50")
+    distance_km = float(delivery.distance_total or 0)
+    
+    # Bonus por distancia > 5km
+    if distance_km > 5:
+        base_rate += Decimal(str((distance_km - 5) * 0.50))
+    
+    # Bonus por cumplir SLA
+    if delivery.sla_compliant:
+        bonus = Decimal("1.00")
+    else:
+        bonus = Decimal("0.00")
+    
+    total_amount = base_rate + bonus
+    
+    # Crear registro financiero
+    financial_service = FinancialService(db)
+    order_ref = getattr(order, 'external_id', str(delivery.id)) if order else str(delivery.id)
+    
+    await financial_service.create_ledger_entry(
+        rider_id=str(rider_id),
+        amount=total_amount,
+        transaction_type=TransactionType.PAGO_ENTREGA,
+        description=f"Pago por entrega completada - Orden {order_ref}",
+        reference_id=str(delivery.order_id),
+        source_type="delivery_completion",
+        source_id=str(delivery.id),
+        idempotency_key=idempotency_key,
+        status=PaymentStatus.PROCESADO,
+        commit=False,  # No hacer commit aquí, lo hará el caller
+    )
+    logger.info(f"Registro financiero creado para entrega {delivery.id}, monto: {total_amount}")
 
 @router.post("/{delivery_id}/fail")
 async def fail_delivery(

@@ -1,58 +1,39 @@
-Nothing needs to be added to .gitignore since only a markdown file (.md) was added and there are no build artifacts, dependencies, or temporary files in the changes.```
-# Dependencies
-node_modules/
-
-# Build artifacts
-dist/
-build/
-.next/
-out/
-
-
-# IDE files
-.vscode/
-.idea/
-*.swp
-*.swo
-
+```
 # Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-.Python
-env/
-venv/
-.venv/
-pip-log.txt
-pip-delete-this-directory.txt
-.tox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
+
+# Logs and temp files
 *.log
-*.pot
-*.pyc
-*.pyo
+*.tmp
+
+# Environment
+.env
+.env.local
+.env.*
+
+# Editors
+.vscode/
+.idea/
+
+# Dependencies
+.venv/
+venv/
+node_modules/
+
+# Build artifacts
+dist/
+build/
+target/
+
+# Coverage
+.coverage
+coverage/
+htmlcov/
+
+# Tests
 .pytest_cache/
 .mypy_cache/
-.hypothesis/
-
-# Logs
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
-# OS generated files
-.DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
 ```
