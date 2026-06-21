@@ -1,10 +1,10 @@
 """
 Delivery360 - API Endpoints para Entregas (VERSIÓN PRODUCCIÓN)
-Optimizado para rendimiento, sin logs de debug y con serialización robusta.
+Optimizado para rendimiento, paginación estable y serialización robusta.
 """
 from datetime import datetime, timezone
 import uuid
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -106,60 +106,6 @@ def _serialize_delivery(delivery: Delivery, rider: Optional[Rider], user: Option
         "updated_at": delivery.updated_at.isoformat() if delivery.updated_at else None,
     }
 
-
-def _order_status_to_delivery_status(order_status) -> str:
-    status_value = order_status.value if hasattr(order_status, "value") else str(order_status)
-    if status_value == OrderStatus.ENTREGADO.value:
-        return DeliveryStatus.COMPLETADA.value
-    if status_value == OrderStatus.FALLIDO.value:
-        return DeliveryStatus.FALLIDA.value
-    if status_value in (OrderStatus.RECOLECTADO.value, OrderStatus.EN_RUTA.value):
-        return DeliveryStatus.EN_ROUTE.value
-    if status_value == OrderStatus.ASIGNADO.value:
-        return DeliveryStatus.INICIADA.value
-    return DeliveryStatus.PENDIENTE.value
-
-
-def _serialize_order_as_delivery(order: Order, rider: Optional[Rider], user: Optional[User]) -> Dict[str, Any]:
-    """Fallback para órdenes asignadas que aún no tienen fila en deliveries."""
-    rider_data = None
-    if rider:
-        rider_data = {
-            "id": str(rider.id),
-            "first_name": user.first_name if user else "Sin Nombre",
-            "last_name": user.last_name or "",
-            "vehicle_type": rider.vehicle_type.value if rider.vehicle_type else None,
-            "status": rider.status.value if rider.status else None,
-            "is_online": getattr(rider, 'is_online', False),
-        }
-
-    status = _order_status_to_delivery_status(order.status)
-    return {
-        "id": f"order-{order.id}",
-        "order_id": str(order.id),
-        "external_id": order.external_id,
-        "customer_name": order.customer_name or "Desconocido",
-        "rider_id": str(order.assigned_rider_id) if order.assigned_rider_id else None,
-        "rider": rider_data,
-        "status": status,
-        "started_at": order.accepted_at.isoformat() if order.accepted_at else None,
-        "completed_at": order.delivered_at.isoformat() if order.delivered_at else None,
-        "current_latitude": getattr(rider, "last_lat", None) if rider else None,
-        "current_longitude": getattr(rider, "last_lng", None) if rider else None,
-        "last_location_update": rider.last_location_at.isoformat() if rider and rider.last_location_at else None,
-        "pickup_address": order.pickup_address,
-        "delivery_address": order.delivery_address,
-        "estimated_delivery_time": order.estimated_delivery_time.isoformat() if order.estimated_delivery_time else None,
-        "total_amount": order.total,
-        "payment_method": order.payment_method,
-        "total_time": None,
-        "distance_total": None,
-        "sla_compliant": None,
-        "sla_actual_minutes": None,
-        "created_at": order.created_at.isoformat() if order.created_at else None,
-        "updated_at": order.updated_at.isoformat() if order.updated_at else None,
-    }
-
 # --- Endpoints Principales ---
 
 @router.get("")
@@ -169,13 +115,18 @@ async def list_deliveries(
     order_id: Optional[str] = Query(None),
     limit: int = Query(50, le=200),
     offset: int = Query(0),
-    include_total: bool = Query(False),
+    include_total: bool = Query(True), # Por defecto true para facilitar la paginación frontend
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
     Lista entregas con JOINs explícitos para obtener datos de Riders, Users y Orders.
     Soporta paginación y filtros por estado, rider u orden.
+    
+    GARANTÍA DE ESTABILIDAD: 
+    El conteo total se realiza estrictamente sobre la tabla 'deliveries' filtrada,
+    evitando inconsistencias al cambiar de página.
+    
     Devuelve: { "items": [...], "total": <count_real> }
     """
     # 1. Definición de Alias para evitar ambigüedades en JOINs
@@ -184,7 +135,7 @@ async def list_deliveries(
     u_alias = aliased(User)
     o_alias = aliased(Order)
 
-    # 2. Construcción de consulta base SIN paginación (para contar)
+    # 2. Construcción de consulta base (SELECT + JOINS)
     base_stmt = (
         select(d_alias, r_alias, u_alias, o_alias)
         .outerjoin(r_alias, d_alias.rider_id == r_alias.id)
@@ -192,13 +143,15 @@ async def list_deliveries(
         .outerjoin(o_alias, d_alias.order_id == o_alias.id)
     )
 
-    # 3. Filtros de Seguridad y Negocio
+    # 3. Aplicación de Filtros
+    # Filtro por Rol (Repartidor solo ve lo suyo)
     if current_user.role == UserRole.REPARTIDOR:
         rider_profile = await _get_rider_for_user(db, current_user.id)
         if not rider_profile:
             raise HTTPException(status_code=404, detail="Perfil de repartidor no encontrado")
         base_stmt = base_stmt.where(d_alias.rider_id == rider_profile.id)
 
+    # Filtros de Consulta
     if status:
         try:
             base_stmt = base_stmt.where(d_alias.status == DeliveryStatus(status))
@@ -211,85 +164,33 @@ async def list_deliveries(
     if order_id:
         base_stmt = base_stmt.where(d_alias.order_id == _parse_uuid(order_id, "order_id"))
 
-    # 4. Conteo TOTAL antes de aplicar cualquier lógica de fallback o paginación
+    # 4. Conteo TOTAL (Antes de aplicar OFFSET/LIMIT)
+    # Esto garantiza que el total sea consistente independientemente de la página solicitada.
     count_stmt = select(func.count()).select_from(base_stmt.subquery())
     total_result = await db.execute(count_stmt)
     total_count = total_result.scalar() or 0
 
-    # 5. Aplicar ordenamiento y paginación a la consulta principal
+    # 5. Aplicar Ordenamiento y Paginación
     stmt = base_stmt.order_by(d_alias.created_at.desc())
     stmt = stmt.offset(offset).limit(limit)
     
-    # 6. Ejecución consulta principal
+    # 6. Ejecución de la consulta principal
     result = await db.execute(stmt)
     rows = result.all()
 
-    # 7. Serialización
+    # 7. Serialización de resultados
     items = []
     for row in rows:
         delivery, rider, user, order = row
         items.append(_serialize_delivery(delivery, rider, user, order))
 
-    # 8. Fallback: órdenes asignadas que todavía no tienen registro en deliveries.
-    # Esto cubre órdenes creadas/asignadas desde manager y datos migrados/legacy.
-    # NOTA: Para mantener la consistencia del conteo total en paginación estricta,
-    # este fallback se procesa pero no altera el 'total_count' calculado arriba si ya hay paginación.
-    # Si necesitas que el fallback afecte el total, deberías contar también aquí.
-    # En este diseño, priorizamos rendimiento: el total es de la tabla Delivery.
-    
-    missing_delivery_alias = aliased(Delivery)
-    fallback_rider = aliased(Rider)
-    fallback_user = aliased(User)
-    fallback_stmt = (
-        select(o_alias, fallback_rider, fallback_user)
-        .outerjoin(missing_delivery_alias, missing_delivery_alias.order_id == o_alias.id)
-        .outerjoin(fallback_rider, o_alias.assigned_rider_id == fallback_rider.id)
-        .outerjoin(fallback_user, fallback_rider.user_id == fallback_user.id)
-        .where(
-            o_alias.assigned_rider_id.isnot(None),
-            missing_delivery_alias.id.is_(None),
-        )
-        .order_by(o_alias.created_at.desc())
-    )
-
-    if current_user.role == UserRole.REPARTIDOR:
-        rider_profile = await _get_rider_for_user(db, current_user.id)
-        if rider_profile:
-            fallback_stmt = fallback_stmt.where(o_alias.assigned_rider_id == rider_profile.id)
-
-    if rider_id:
-        fallback_stmt = fallback_stmt.where(o_alias.assigned_rider_id == _parse_uuid(rider_id, "rider_id"))
-    if order_id:
-        fallback_stmt = fallback_stmt.where(o_alias.id == _parse_uuid(order_id, "order_id"))
-
-    # Ejecutar fallback solo si estamos en la primera página o si necesitamos llenar huecos
-    # Para simplificar y asegurar estabilidad en paginación, añadimos el fallback al final
-    # pero ten en cuenta que esto puede duplicar páginas si no se maneja con cuidado.
-    # Estrategia segura: El fallback se usa principalmente para vistas "sin paginación estricta" 
-    # o se asume que la creación de Delivery es inmediata.
-    # Aquí lo incluimos para compatibilidad, pero el 'total' refleja principalmente la tabla Delivery.
-    
-    if offset == 0: # Solo cargar fallback en la primera página para no romper paginación
-        fallback_result = await db.execute(fallback_stmt.limit(50)) # Límite de seguridad
-        for order, rider, user in fallback_result.all():
-            fallback_item = _serialize_order_as_delivery(order, rider, user)
-            if status and fallback_item["status"] != status:
-                continue
-            items.append(fallback_item)
-
-    # Si incluyeron fallback, ajustamos el total ligeramente si es necesario, 
-    # pero para estabilidad de UI, mantenemos el total de la consulta principal + fallback count si fuera crítico.
-    # En este caso, devolvemos el total real de items devueltos si hay fallback, o el count DB.
-    final_total = total_count + len(items) - len(rows) if offset == 0 else total_count
-
-    response_data = {
+    # 8. Respuesta Estructurada
+    return {
         "items": items,
-        "total": final_total,
+        "total": total_count,
         "limit": limit,
         "offset": offset
     }
-
-    return response_data
 
 @router.get("/{delivery_id}")
 async def get_delivery(
@@ -373,7 +274,6 @@ async def assign_delivery(
     u_alias = aliased(User)
     o_alias = aliased(Order)
     
-    # Re-ejecutar consulta rápida para obtener los objetos unidos correctamente
     final_stmt = (
         select(Delivery, r_alias, u_alias, o_alias)
         .outerjoin(r_alias, Delivery.rider_id == r_alias.id)
@@ -417,12 +317,10 @@ async def start_delivery(
 
     await db.commit()
     
-    # Refresh y re-serialización
     await db.refresh(delivery, attribute_names=['rider', 'order'])
     if delivery.rider:
         await db.refresh(delivery.rider, attribute_names=['user'])
         
-    # Consulta auxiliar para serialización limpia
     r_alias = aliased(Rider)
     u_alias = aliased(User)
     o_alias = aliased(Order)
@@ -492,7 +390,6 @@ async def complete_delivery(
     if delivery.rider:
         await db.refresh(delivery.rider, attribute_names=['user'])
 
-    # Serialización final
     r_alias = aliased(Rider)
     u_alias = aliased(User)
     o_alias = aliased(Order)
@@ -551,7 +448,6 @@ async def fail_delivery(
     if delivery.rider:
         await db.refresh(delivery.rider, attribute_names=['user'])
 
-    # Serialización final
     r_alias = aliased(Rider)
     u_alias = aliased(User)
     o_alias = aliased(Order)
@@ -571,7 +467,7 @@ async def fail_delivery(
 @router.patch("/{delivery_id}/location")
 async def update_location(
     delivery_id: str,
-    body: DeliveryStart, # Reutilizamos el schema que ya tiene lat/lng
+    body: DeliveryStart,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -579,7 +475,6 @@ async def update_location(
     Actualiza la ubicación GPS de una entrega en curso.
     Usado por la app del repartidor o servicios de tracking.
     """
-    # 1. Obtener entrega
     stmt = select(Delivery).where(Delivery.id == _parse_uuid(delivery_id, "delivery_id"))
     result = await db.execute(stmt)
     delivery = result.scalar_one_or_none()
@@ -587,18 +482,11 @@ async def update_location(
     if not delivery:
         raise HTTPException(status_code=404, detail="Entrega no encontrada")
 
-    # 2. Validar permisos (Solo el rider asignado o admins pueden actualizar)
     if current_user.role == UserRole.REPARTIDOR:
         rider_profile = await _get_rider_for_user(db, current_user.id)
         if not rider_profile or delivery.rider_id != rider_profile.id:
             raise HTTPException(status_code=403, detail="No autorizado para actualizar esta ubicación")
     
-    # 3. Validar que la entrega esté en estado de movimiento
-    if delivery.status not in [DeliveryStatus.INICIADA, DeliveryStatus.EN_PICKUP, DeliveryStatus.EN_ROUTE, DeliveryStatus.EN_DESTINO]:
-        # Permitimos actualizar incluso si está completada recientemente por latencia de red, pero no guardamos
-        pass 
-
-    # 4. Actualizar coordenadas y timestamp
     lat = body.lat if body.lat is not None else body.latitude
     lng = body.lng if body.lng is not None else body.longitude
 
@@ -607,7 +495,6 @@ async def update_location(
         delivery.current_longitude = lng
         delivery.last_location_update = datetime.now(timezone.utc)
         
-        # Actualizar también en el Rider por redundancia
         if delivery.rider_id:
             rider_stmt = select(Rider).where(Rider.id == delivery.rider_id)
             rider_res = await db.execute(rider_stmt)
@@ -630,7 +517,6 @@ async def get_previous_view(
 ):
     """
     Endpoint auxiliar para el botón 'Volver' del frontend.
-    Devuelve la ruta adecuada según el rol del usuario.
     """
     routes = {
         UserRole.SUPERADMIN: "/manager/dashboard",

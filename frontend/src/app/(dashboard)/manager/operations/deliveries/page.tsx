@@ -23,6 +23,7 @@ interface RiderInfo {
   first_name: string;
   last_name: string;
   vehicle_type?: string | null;
+  status?: string | null;
 }
 
 interface DeliveryRow {
@@ -39,11 +40,11 @@ interface DeliveryRow {
   customer_name: string;
 }
 
-// CRÍTICO: Alinear opciones con el valor por defecto
-const ROWS_PER_PAGE_OPTIONS = [20, 30, 40, 50];
-const DEFAULT_PAGE_SIZE = 20; // Debe coincidir con la primera opción
+// Opciones de filas por página
+const ROWS_PER_PAGE_OPTIONS = [20, 25, 50, 100];
+const DEFAULT_PAGE_SIZE = 20;
 
-// --- Helpers de Utilidad (Pure Functions) ---
+// --- Helpers de Utilidad ---
 
 const getInitials = (firstName?: string, lastName?: string): string => {
   const f = firstName?.trim().charAt(0) || '';
@@ -91,69 +92,55 @@ export default function ManagerDeliveriesPage() {
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
   const [statusFilter, setStatusFilter] = useState<string>('ALL');
-  const [riderFilter, setRiderFilter] = useState<string>('ALL');
+  const [riderIdFilter, setRiderIdFilter] = useState<string>('ALL');
   const [searchTerm, setSearchTerm] = useState('');
   
   // Cálculos derivados (Memoizados)
-  // Calculamos totalPages máximo posible, pero validamos en la carga real
+  // Calculamos totalPages basado estrictamente en totalItems y pageSize actuales
   const totalPages = useMemo(() => {
     if (totalItems === 0) return 1;
-    return Math.max(1, Math.ceil(totalItems / pageSize));
+    return Math.ceil(totalItems / pageSize);
   }, [totalItems, pageSize]);
+  
+  // Lógica de "Safe Page": Evita saltos bruscos si la página actual excede el total
+  // pero solo corrige si estamos realmente fuera de rango después de cargar.
+  const safePage = useMemo(() => {
+    if (page < 1) return 1;
+    if (page > totalPages) return totalPages;
+    return page;
+  }, [page, totalPages]);
 
-  const startIndex = useMemo(() => {
-    if (totalItems === 0) return 0;
-    return (page - 1) * pageSize + 1;
-  }, [totalItems, page, pageSize]);
-
-  const endIndex = useMemo(() => {
-    return Math.min(page * pageSize, totalItems);
-  }, [page, pageSize, totalItems]);
+  const startIndex = useMemo(() => (totalItems === 0 ? 0 : (safePage - 1) * pageSize + 1), [totalItems, safePage, pageSize]);
+  const endIndex = useMemo(() => Math.min(safePage * pageSize, totalItems), [safePage, pageSize, totalItems]);
 
   // --- Lógica de Carga Robusta ---
-  const loadDeliveries = useCallback(async (isRetry = false, requestedPage: number = page) => {
+  // NOTA: Eliminada 'totalPages' de las dependencias para evitar bucles de renderizado innecesarios
+  const loadDeliveries = useCallback(async (isRetry = false) => {
     if (isRetry) setIsRetrying(true);
     else setIsLoading(true);
     
     setError(null);
 
     try {
-      // Calcular offset basado en la página solicitada
-      const currentOffset = (requestedPage - 1) * pageSize;
+      // Usamos 'page' directamente aquí. Si 'page' es mayor que el total real,
+      // el backend devolverá items vacíos y total correcto.
+      // En el siguiente render, 'safePage' se ajustará visualmente.
+      
+      const offset = (page - 1) * pageSize;
 
       const response = await deliveryService.getPage({
         limit: pageSize,
-        offset: currentOffset,
+        offset: offset,
         status: statusFilter !== 'ALL' ? statusFilter : undefined,
-        rider_id: riderFilter !== 'ALL' && riderFilter !== 'UNASSIGNED' ? riderFilter : undefined,
+        rider_id: riderIdFilter !== 'ALL' && riderIdFilter !== 'UNASSIGNED' ? riderIdFilter : undefined,
         include_total: true,
       });
 
       const items: any[] = response.items || [];
-      const newTotal = response.total || 0;
-
-      // CORRECCIÓN CRÍTICA DE PAGINACIÓN:
-      // Si pedimos una página y viene vacía, pero el total dice que hay datos,
-      // significa que el total cambió (borraron datos) o nos pasamos del límite.
-      // En lugar de mostrar vacío o saltar a la pág 1 bruscamente, ajustamos la página.
-      if (items.length === 0 && newTotal > 0 && requestedPage > 1) {
-        const lastValidPage = Math.max(1, Math.ceil(newTotal / pageSize));
-        if (lastValidPage < requestedPage) {
-          // Recursivamente cargamos la última página válida sin marcar como error
-          setPage(lastValidPage);
-          // No retornamos aquí, dejamos que el useEffect dispare la carga nuevamente con la nueva página
-          // O forzamos la carga inmediata con la página corregida:
-          return loadDeliveries(false, lastValidPage);
-        }
-      }
-
-      setTotalItems(newTotal);
-      // Solo actualizamos la página del estado si fue corregida arriba, sino mantenemos la solicitada
-      if (requestedPage !== page) {
-         setPage(requestedPage);
-      }
-
-      const enrichedData: DeliveryRow[] = items.map((item: any) => {
+      const total = response.total || 0;
+      
+      setTotalItems(total);
+      setDeliveries(items.map((item: any) => {
         const rider = item.rider;
         const hasRider = !!rider && typeof rider === 'object';
         
@@ -170,9 +157,18 @@ export default function ManagerDeliveriesPage() {
           customer_name: item.customer_name?.trim() || 'Cliente Desconocido',
           rider_details: hasRider ? rider as RiderInfo : null
         };
-      });
+      }));
 
-      setDeliveries(enrichedData);
+      // CORRECCIÓN CRÍTICA: Si pedimos una página que ya no existe (ej. borraron datos),
+      // y estamos en la última página posible, no hacemos nada (el usuario ve tabla vacía o ajusta manual).
+      // Si queremos auto-corregir, lo hacemos SOLO si recibimos 0 items pero sabemos que hay datos totales.
+      if (items.length === 0 && total > 0 && page > 1) {
+        // Auto-ajuste suave: si no hay datos en esta página pero hay total, vamos a la última válida.
+        const lastValidPage = Math.ceil(total / pageSize);
+        if (page > lastValidPage) {
+            setPage(lastValidPage);
+        }
+      }
 
     } catch (err: any) {
       let msg = 'No se pudieron cargar los datos.';
@@ -191,11 +187,11 @@ export default function ManagerDeliveriesPage() {
       setIsLoading(false);
       setIsRetrying(false);
     }
-  }, [pageSize, statusFilter, riderFilter, router, page]); // 'page' se usa solo como fallback, la lógica usa requestedPage
+  }, [page, pageSize, statusFilter, riderIdFilter, router]); // Dependencias estables
 
   useEffect(() => {
     loadDeliveries();
-  }, [loadDeliveries, page]); // Dependencia de page activa la carga cuando cambia
+  }, [loadDeliveries]);
 
   useEffect(() => {
     const loadRiders = async () => {
@@ -203,21 +199,26 @@ export default function ManagerDeliveriesPage() {
         const data = await riderService.getAll();
         setRiders(data);
       } catch (err) {
-        console.warn('No se pudieron cargar riders para filtros de entregas:', err);
+        console.warn('No se pudieron cargar riders para filtros:', err);
       }
     };
 
     loadRiders();
   }, []);
 
-  // Filtrado local solo para búsqueda de texto (no afecta paginación del servidor)
+  // Filtrado cliente-side (Solo búsqueda textual y filtro "Sin asignar")
+  // Esto filtra SOBRE los datos ya paginados traídos del backend para la búsqueda rápida
   const filteredDeliveries = useMemo(() => {
     const term = searchTerm.trim().toLowerCase();
-    if (!term) return deliveries; // Si no hay búsqueda, mostramos lo que vino del server
     
     return deliveries.filter((delivery) => {
-      const matchesRider = riderFilter !== 'UNASSIGNED' || !delivery.rider_id;
-      if (!matchesRider) return false;
+      // Filtro de "Sin asignar"
+      if (riderIdFilter === 'UNASSIGNED') {
+        if (delivery.rider_id) return false;
+      }
+
+      // Búsqueda textual
+      if (!term) return true;
 
       const riderName = delivery.rider_details
         ? `${delivery.rider_details.first_name} ${delivery.rider_details.last_name}`.trim()
@@ -232,7 +233,7 @@ export default function ManagerDeliveriesPage() {
         delivery.status,
       ].some((value) => String(value || '').toLowerCase().includes(term));
     });
-  }, [deliveries, riderFilter, searchTerm]);
+  }, [deliveries, riderIdFilter, searchTerm]);
 
   // --- Handlers ---
   const handlePageChange = (newPage: number) => {
@@ -243,8 +244,7 @@ export default function ManagerDeliveriesPage() {
   };
 
   const handlePageSizeChange = (newSize: string) => {
-    const sizeNum = Number(newSize);
-    setPageSize(sizeNum);
+    setPageSize(Number(newSize));
     setPage(1); // Reset a página 1 al cambiar tamaño
   };
 
@@ -253,16 +253,16 @@ export default function ManagerDeliveriesPage() {
     setPage(1);
   };
 
-  const handleRiderChange = (val: string) => {
-    setRiderFilter(val);
+  const handleRiderIdChange = (val: string) => {
+    setRiderIdFilter(val);
     setPage(1);
   };
 
-  const hasActiveFilters = statusFilter !== 'ALL' || riderFilter !== 'ALL' || searchTerm.trim().length > 0;
+  const hasActiveFilters = statusFilter !== 'ALL' || riderIdFilter !== 'ALL' || searchTerm.trim().length > 0;
 
   const clearFilters = () => {
     setStatusFilter('ALL');
-    setRiderFilter('ALL');
+    setRiderIdFilter('ALL');
     setSearchTerm('');
     setPage(1);
   };
@@ -294,7 +294,7 @@ export default function ManagerDeliveriesPage() {
   return (
     <div className="p-6 bg-slate-50/50 min-h-screen space-y-6 font-sans">
       
-      {/* Header con Navegación */}
+      {/* Header */}
       <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
         <div className="flex items-center gap-3">
           <Button 
@@ -331,33 +331,35 @@ export default function ManagerDeliveriesPage() {
         </div>
       </div>
 
-      {/* Panel de Control y Filtros */}
+      {/* Panel de Filtros Simplificado */}
       <Card className="border-slate-200 shadow-sm bg-white">
         <CardContent className="p-4">
           <div className="flex flex-col xl:flex-row gap-4 justify-between items-end xl:items-center">
             
             <div className="flex flex-wrap gap-3 w-full xl:w-auto">
-              <div className="w-full sm:w-72 space-y-1.5">
+              {/* Búsqueda Textual */}
+              <div className="w-full sm:w-64 space-y-1.5">
                 <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider pl-1">Búsqueda</label>
                 <div className="relative">
                   <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 w-4 h-4" />
                   <input
                     value={searchTerm}
                     onChange={(event) => setSearchTerm(event.target.value)}
-                    placeholder="Orden, cliente, rider o estado..."
+                    placeholder="Orden, cliente, rider..."
                     className="w-full h-9 pl-9 pr-3 border border-slate-300 rounded-md bg-white focus:ring-2 focus:ring-blue-500 outline-none text-sm"
                   />
                 </div>
               </div>
 
-              <div className="w-full sm:w-48 space-y-1.5">
-                <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider pl-1">Estado</label>
+              {/* Estado de la Entrega */}
+              <div className="w-full sm:w-40 space-y-1.5">
+                <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider pl-1">Estado Entrega</label>
                 <Select value={statusFilter} onValueChange={handleStatusChange}>
                   <SelectTrigger className="h-9 bg-white shadow-none">
                     <SelectValue placeholder="Todos" />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="ALL">Todos los estados</SelectItem>
+                    <SelectItem value="ALL">Todos</SelectItem>
                     <SelectItem value="PENDIENTE">Pendiente</SelectItem>
                     <SelectItem value="INICIADA">Iniciada</SelectItem>
                     <SelectItem value="EN_ROUTE">En Ruta</SelectItem>
@@ -367,26 +369,28 @@ export default function ManagerDeliveriesPage() {
                 </Select>
               </div>
 
-              <div className="w-full sm:w-56 space-y-1.5">
+              {/* Selector de Repartidor (Solo Nombre) */}
+              <div className="w-full sm:w-48 space-y-1.5">
                 <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider pl-1">Repartidor</label>
-                <Select value={riderFilter} onValueChange={handleRiderChange}>
+                <Select value={riderIdFilter} onValueChange={handleRiderIdChange}>
                   <SelectTrigger className="h-9 bg-white shadow-none">
-                    <SelectValue placeholder="Todos los riders" />
+                    <SelectValue placeholder="Todos" />
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="ALL">Todos los riders</SelectItem>
                     <SelectItem value="UNASSIGNED">Sin asignar</SelectItem>
                     {riders.map((rider) => (
                       <SelectItem key={rider.id} value={rider.id}>
-                        {rider.first_name} {rider.last_name} {rider.status ? `· ${rider.status}` : ''}
+                        {rider.first_name} {rider.last_name}
                       </SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
               </div>
               
+              {/* Filas por página */}
               <div className="w-full sm:w-32 space-y-1.5">
-                <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider pl-1">Filas por página</label>
+                <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider pl-1">Filas</label>
                 <Select value={String(pageSize)} onValueChange={handlePageSizeChange}>
                   <SelectTrigger className="h-9 bg-white shadow-none">
                     <SelectValue />
@@ -400,13 +404,10 @@ export default function ManagerDeliveriesPage() {
               </div>
             </div>
 
+            {/* Contador de registros */}
             <div className="text-xs font-medium text-slate-500 bg-slate-50 px-3 py-2 rounded-md border border-slate-200 whitespace-nowrap">
-              {totalItems > 0 ? (
-                <>Mostrando <span className="text-slate-900 font-bold">{startIndex}-{endIndex}</span> de <span className="text-slate-900 font-bold">{totalItems}</span> registros</>
-              ) : (
-                <>Sin registros</>
-              )}
-              {searchTerm && <span className="ml-2">· {filteredDeliveries.length} coincidencias en vista</span>}
+              Mostrando <span className="text-slate-900 font-bold">{totalItems > 0 ? startIndex : 0}-{endIndex}</span> de <span className="text-slate-900 font-bold">{totalItems}</span> registros
+              {searchTerm && <span> · {filteredDeliveries.length} coincidencias</span>}
             </div>
           </div>
         </CardContent>
@@ -503,9 +504,10 @@ export default function ManagerDeliveriesPage() {
                             <span className={`text-sm font-medium truncate max-w-[140px] ${!hasRider ? 'text-slate-400 italic' : 'text-slate-700'}`}>
                               {riderName}
                             </span>
-                            {hasRider && d.rider_details?.vehicle_type && (
-                              <span className="text-[10px] text-slate-400 uppercase tracking-wide flex items-center gap-1">
-                                <Truck className="w-2.5 h-2.5" /> {d.rider_details.vehicle_type}
+                            {/* Visualización discreta del estado del rider si existe */}
+                            {hasRider && d.rider_details?.status && (
+                              <span className="text-[10px] text-slate-400 uppercase tracking-wide">
+                                {d.rider_details.status}
                               </span>
                             )}
                           </div>
@@ -562,7 +564,7 @@ export default function ManagerDeliveriesPage() {
                   );
                 })
               ) : (
-                !error && !isLoading && (
+                !error && (
                   <tr>
                     <td colSpan={8} className="px-6 py-20 text-center">
                       <div className="flex flex-col items-center justify-center text-slate-400 max-w-sm mx-auto">
@@ -571,7 +573,7 @@ export default function ManagerDeliveriesPage() {
                         </div>
                         <p className="text-lg font-semibold text-slate-900">No hay entregas encontradas</p>
                         <p className="text-sm mt-1 text-slate-500 text-center">
-                          {hasActiveFilters ? 'No existen registros con los filtros actuales.' : 'No hay registros en el sistema.'}
+                          No existen registros con los filtros actuales.
                         </p>
                         {hasActiveFilters && (
                           <Button variant="link" onClick={clearFilters} className="mt-4 text-blue-600 font-medium">
@@ -590,19 +592,19 @@ export default function ManagerDeliveriesPage() {
         {!isLoading && totalItems > 0 && (
           <div className="border-t border-slate-200 bg-slate-50 px-6 py-4 flex items-center justify-between">
             <div className="text-xs text-slate-500 hidden md:block">
-              Página <span className="font-medium text-slate-900">{page}</span> de <span className="font-medium text-slate-900">{totalPages}</span>
+              Página <span className="font-medium text-slate-900">{safePage}</span> de <span className="font-medium text-slate-900">{totalPages}</span>
             </div>
             
             <div className="flex items-center gap-2 w-full md:w-auto justify-end">
               <Button 
-                variant="outline" size="sm" onClick={() => handlePageChange(1)} disabled={page === 1}
+                variant="outline" size="sm" onClick={() => handlePageChange(1)} disabled={safePage === 1}
                 className="h-8 w-8 p-0 hover:bg-white disabled:opacity-50"
                 aria-label="Primera página"
               >
                 <ChevronsLeft className="w-4 h-4" />
               </Button>
               <Button 
-                variant="outline" size="sm" onClick={() => handlePageChange(page - 1)} disabled={page === 1}
+                variant="outline" size="sm" onClick={() => handlePageChange(safePage - 1)} disabled={safePage === 1}
                 className="h-8 w-8 p-0 hover:bg-white disabled:opacity-50"
                 aria-label="Página anterior"
               >
@@ -610,18 +612,18 @@ export default function ManagerDeliveriesPage() {
               </Button>
               
               <span className="text-sm font-medium text-slate-700 px-2 min-w-[3rem] text-center select-none">
-                {page}
+                {safePage}
               </span>
               
               <Button 
-                variant="outline" size="sm" onClick={() => handlePageChange(page + 1)} disabled={page >= totalPages}
+                variant="outline" size="sm" onClick={() => handlePageChange(safePage + 1)} disabled={safePage >= totalPages}
                 className="h-8 w-8 p-0 hover:bg-white disabled:opacity-50"
                 aria-label="Página siguiente"
               >
                 <ChevronRight className="w-4 h-4" />
               </Button>
               <Button 
-                variant="outline" size="sm" onClick={() => handlePageChange(totalPages)} disabled={page >= totalPages}
+                variant="outline" size="sm" onClick={() => handlePageChange(totalPages)} disabled={safePage >= totalPages}
                 className="h-8 w-8 p-0 hover:bg-white disabled:opacity-50"
                 aria-label="Última página"
               >

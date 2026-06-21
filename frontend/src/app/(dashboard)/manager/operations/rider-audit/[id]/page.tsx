@@ -5,7 +5,7 @@ import { useParams, useRouter } from 'next/navigation';
 import { ArrowLeft, Bike, Clock, CreditCard, Package, RefreshCw, Truck, Wallet } from 'lucide-react';
 import { riderService, RiderAuditSummary } from '@/services/rider.service';
 import { orderService, Order } from '@/services/order.service';
-import { deliveryService, Delivery } from '@/services/delivery.service';
+import { deliveryService, Delivery, DeliveryListResponse } from '@/services/delivery.service';
 import { transactionService, Transaction } from '@/services/transaction.service';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -14,6 +14,16 @@ import { Alert, AlertDescription } from '@/components/ui/alert';
 import { formatCurrency } from '@/lib/formatters';
 
 const numberFormatter = new Intl.NumberFormat('es-CO');
+
+// Helper robusto para extraer items tanto de arrays como de respuestas paginadas { items, total }
+const extractItems = <T,>(response: any): T[] => {
+  if (!response) return [];
+  if (Array.isArray(response)) return response;
+  if (typeof response === 'object' && 'items' in response) {
+    return Array.isArray(response.items) ? response.items : [];
+  }
+  return [];
+};
 
 export default function ManagerRiderAuditDetailPage() {
   const params = useParams();
@@ -34,37 +44,63 @@ export default function ManagerRiderAuditDetailPage() {
     setError(null);
 
     try {
+      // Usamos un limit de 200 que suele ser el estándar seguro en backends paginados.
+      // Si necesitas más, deberías implementar paginación en el frontend o aumentar el 'le' en el backend.
+      const LIMIT_AUDIT = 200; 
+
       const [summaryResult, ordersResult, deliveriesResult, transactionsResult] = await Promise.allSettled([
-        riderService.getAuditSummary({ limit: 500 }),
-        orderService.getAll({ rider_id: riderId, limit: 100 }),
-        deliveryService.getAll({ rider_id: riderId, limit: 100 }),
-        transactionService.getAll({ rider_id: riderId, limit: 100 }),
+        riderService.getAuditSummary({ limit: LIMIT_AUDIT }),
+        orderService.getAll({ rider_id: riderId, limit: LIMIT_AUDIT }),
+        deliveryService.getAll({ rider_id: riderId, limit: LIMIT_AUDIT, include_total: false }), 
+        transactionService.getAll({ rider_id: riderId, limit: LIMIT_AUDIT }),
       ]);
 
+      // Procesar Resumen
       if (summaryResult.status === 'fulfilled') {
-        setSummary(summaryResult.value.items.find((item) => item.rider_id === riderId) || null);
+        const data = summaryResult.value;
+        const items = extractItems<RiderAuditSummary>(data);
+        const found = items.find((item) => item.rider_id === riderId);
+        setSummary(found || null);
       } else {
-        console.warn('No se pudo cargar resumen del rider:', summaryResult.reason);
+        console.warn('[AuditPage] No se pudo cargar el resumen:', summaryResult.reason);
         setSummary(null);
       }
 
-      setOrders(ordersResult.status === 'fulfilled' 
-        ? (Array.isArray(ordersResult.value) ? ordersResult.value : (ordersResult.value as any).items || []) 
-        : []);
-
-      setDeliveries(deliveriesResult.status === 'fulfilled' 
-        ? (Array.isArray(deliveriesResult.value) ? deliveriesResult.value : (deliveriesResult.value as any).items || []) 
-        : []);
-
-      setTransactions(transactionsResult.status === 'fulfilled' 
-        ? (Array.isArray(transactionsResult.value) ? transactionsResult.value : (transactionsResult.value as any).items || []) 
-        : []);
-
-      if (ordersResult.status === 'rejected' || deliveriesResult.status === 'rejected' || transactionsResult.status === 'rejected') {
-        setError('Algunos bloques no pudieron cargarse. Se muestra la información disponible.');
+      // Procesar Órdenes
+      if (ordersResult.status === 'fulfilled') {
+        const items = extractItems<Order>(ordersResult.value);
+        setOrders(items);
+      } else {
+        console.warn('[AuditPage] Error cargando órdenes:', ordersResult.reason);
+        setOrders([]);
       }
+
+      // Procesar Entregas
+      if (deliveriesResult.status === 'fulfilled') {
+        const items = extractItems<Delivery>(deliveriesResult.value);
+        setDeliveries(items);
+      } else {
+        console.warn('[AuditPage] Error cargando entregas:', deliveriesResult.reason);
+        setDeliveries([]);
+      }
+
+      // Procesar Transacciones
+      if (transactionsResult.status === 'fulfilled') {
+        const items = extractItems<Transaction>(transactionsResult.value);
+        setTransactions(items);
+      } else {
+        console.warn('[AuditPage] Error cargando transacciones:', transactionsResult.reason);
+        setTransactions([]);
+      }
+
+      // Reportar errores parciales si todo falló críticamente
+      const allDataFailed = !summary && orders.length === 0 && deliveries.length === 0 && transactions.length === 0;
+      if (allDataFailed) {
+        setError('No se pudo cargar ningún dato del repartidor.');
+      }
+
     } catch (err: any) {
-      console.error('Error loading rider audit detail:', err);
+      console.error('[AuditPage] Error crítico:', err);
       setError(err?.message || 'No se pudo cargar el detalle del repartidor.');
     } finally {
       setLoading(false);
@@ -79,8 +115,9 @@ export default function ManagerRiderAuditDetailPage() {
   const totals = useMemo(() => ({
     ordersTotal: orders.length,
     ordersDelivered: orders.filter((order) => order.status === 'ENTREGADO').length,
-    deliveriesCompleted: deliveries.filter((delivery) => delivery.status === 'COMPLETADA').length,
-    transactionsTotal: transactions.reduce((sum, transaction) => sum + Number(transaction.amount || 0), 0),
+    // Aceptamos COMPLETADA o ENTREGADO como estados válidos de entrega finalizada
+    deliveriesCompleted: deliveries.filter((d) => d.status === 'COMPLETADA' || d.status === 'ENTREGADO').length,
+    transactionsTotal: transactions.reduce((sum, t) => sum + Number(t.amount || 0), 0),
   }), [orders, deliveries, transactions]);
 
   const riderName = summary?.full_name || 'Repartidor';
@@ -109,6 +146,7 @@ export default function ManagerRiderAuditDetailPage() {
           </Alert>
         )}
 
+        {/* Tarjetas de Métricas */}
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
           <MetricCard icon={Bike} label="Estado" value={summary ? `${summary.status} · ${summary.is_online ? 'Online' : 'Offline'}` : 'Sin resumen'} />
           <MetricCard icon={Package} label="Órdenes" value={`${numberFormatter.format(totals.ordersDelivered)}/${numberFormatter.format(totals.ordersTotal)} entregadas`} />
@@ -116,6 +154,7 @@ export default function ManagerRiderAuditDetailPage() {
           <MetricCard icon={Wallet} label="Transacciones" value={formatCurrency(totals.transactionsTotal)} />
         </div>
 
+        {/* Resumen Operativo */}
         {summary && (
           <Card>
             <CardHeader><CardTitle>Resumen operativo</CardTitle></CardHeader>
@@ -130,6 +169,7 @@ export default function ManagerRiderAuditDetailPage() {
           </Card>
         )}
 
+        {/* Tabla: Órdenes */}
         <Section title="Órdenes del repartidor" icon={Package} empty={!loading && orders.length === 0}>
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
@@ -149,6 +189,7 @@ export default function ManagerRiderAuditDetailPage() {
           </div>
         </Section>
 
+        {/* Tabla: Entregas */}
         <Section title="Entregas del repartidor" icon={Truck} empty={!loading && deliveries.length === 0}>
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
@@ -169,6 +210,7 @@ export default function ManagerRiderAuditDetailPage() {
           </div>
         </Section>
 
+        {/* Tabla: Transacciones */}
         <Section title="Transacciones del repartidor" icon={CreditCard} empty={!loading && transactions.length === 0}>
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
